@@ -23,6 +23,25 @@ export interface AutoModelRankedOption {
   supportsServiceTier: boolean;
 }
 
+/**
+ * Providers Autorouter will create a thread on at all. This is the single
+ * source of truth — router.ts's candidate discovery and this file's
+ * benchmark-based ranking both read it, so the two can no longer drift out
+ * of sync (they previously duplicated this as two separate literal sets,
+ * and only router.ts's copy was updated when Antigravity was added, so
+ * rankAutoModelOptions silently kept excluding it from real ranking).
+ */
+export const ROUTABLE_PROVIDER_IDS = new Set([
+  "codex",
+  "claude-code",
+  "acp-cursor",
+  "antigravity",
+]);
+
+export function isRoutableProvider(providerId: string) {
+  return ROUTABLE_PROVIDER_IDS.has(providerId);
+}
+
 interface CursorBenchmark {
   costPerTask: number;
   family: string;
@@ -379,7 +398,7 @@ export function rankAutoModelOptions(args: {
   frugality: number;
   quotaRemainingByProvider: ReadonlyMap<string, number>;
 }): AutoModelRankedOption[] {
-  const supportedProviders = new Set(["codex", "claude-code", "acp-cursor"]);
+  const supportedProviders = ROUTABLE_PROVIDER_IDS;
   const options = args.candidates.flatMap((candidate) => {
     if (!supportedProviders.has(candidate.providerId)) return [];
     const family = benchmarkFamily(candidate.model.model);

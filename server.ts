@@ -14,6 +14,9 @@ import {
 } from "./settings.js";
 
 const SETTINGS_KEY = "settings";
+const MODEL_CATALOG_CACHE_KEY = "model-catalog-cache";
+/** Stale-while-revalidate window, matching prompt-enhancer's picker cache. */
+const MODEL_CATALOG_CACHE_MAX_AGE_MS = 5 * 60_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -48,6 +51,23 @@ const reasoningLevelSchema = z.enum([
   "ultra",
 ]);
 
+const modelCatalogSchema = z.object({
+  providers: z.array(
+    z.object({
+      id: z.string(),
+      displayName: z.string(),
+      models: z.array(
+        z.object({
+          model: z.string(),
+          displayName: z.string(),
+          isDefault: z.boolean(),
+        }),
+      ),
+    }),
+  ),
+});
+export type ModelCatalog = z.infer<typeof modelCatalogSchema>;
+
 const routeResultSchema = z
   .object({
     benchmarkScore: z.number().nullable(),
@@ -77,6 +97,16 @@ export const rpcContract = defineRpcContract({
     input: z.object({ request: newThreadRequestSchema }).strict(),
     output: routeResultSchema,
   },
+  /**
+   * Live provider/model catalog for the decision-agent picker, following
+   * the same pattern as bb-plugin-prompt-enhancer's `listModels`: fetch
+   * available providers + their models, cache to KV so a settings-page
+   * reopen answers instantly, refresh in the background afterward.
+   */
+  listModels: {
+    input: z.null(),
+    output: modelCatalogSchema,
+  },
 });
 
 function parseBoolean(value: string): boolean {
@@ -91,6 +121,37 @@ function formatSettings(settings: AutorouterSettings, json: boolean): string {
     `Enabled: ${settings.enabled ? "yes" : "no"}`,
     `Frugality: ${settings.frugality}/100 ($ -> $$$)`,
     `Decision agent: ${settings.decisionAgent}`,
+    `Automatic fallback chain: ${
+      settings.automaticFallbackChain.length > 0
+        ? settings.automaticFallbackChain.join(" -> ")
+        : "(none — falls straight to any launchable model)"
+    }`,
+    `Difficulty bands: ${
+      settings.difficultyBands.length > 0
+        ? settings.difficultyBands
+            .map(
+              (band) =>
+                `${band.minDifficulty ?? 0}-${band.maxDifficulty ?? 100}: ${band.fallbackChain.join(" -> ") || "(empty)"}`,
+            )
+            .join(" | ")
+        : "(none — always uses benchmark-ranked selection)"
+    }`,
+    `Task-type bands: ${
+      settings.taskTypeBands.length > 0
+        ? settings.taskTypeBands
+            .map((band) => `${band.taskType}: ${band.fallbackChain.join(" -> ") || "(empty)"}`)
+            .join(" | ")
+        : "(none)"
+    }`,
+    `Excluded models: ${settings.excludedModels.length > 0 ? settings.excludedModels.join(", ") : "(none)"}`,
+    `Allowed providers: ${settings.allowedProviders.length > 0 ? settings.allowedProviders.join(", ") : "(unrestricted)"}`,
+    `Escalation rules: ${
+      settings.escalationRules.length > 0
+        ? settings.escalationRules
+            .map((rule) => `${rule.id} (${rule.fromProvider} exhausted -> ${rule.toModel} for ${rule.responseLimit})`)
+            .join(" | ")
+        : "(none)"
+    }`,
     `Custom instructions: ${settings.customInstructions || "(none)"}`,
     "",
   ].join("\n");
@@ -117,11 +178,73 @@ export default async function plugin(bb: BbPluginApi) {
     await bb.storage.kv.set(SETTINGS_KEY, defaultAutorouterSettings);
   }
 
+  // Model catalog for the decision-agent picker. Stale-while-revalidate: a
+  // cached catalog (persisted to KV, so a plugin reload still answers
+  // instantly) is served immediately and refreshed in the background;
+  // concurrent callers share one in-flight fetch.
+  let catalogCache: { at: number; catalog: ModelCatalog } | null = null;
+  let catalogInflight: Promise<ModelCatalog> | null = null;
+
+  function refreshModelCatalog(): Promise<ModelCatalog> {
+    catalogInflight ??= (async () => {
+      const available = (await bb.sdk.providers.list({})).filter(
+        (provider) => provider.available,
+      );
+      const settled = await Promise.allSettled(
+        available.map(async (provider): Promise<ModelCatalog["providers"][number]> => {
+          const result = await bb.sdk.providers.models({ providerId: provider.id });
+          return {
+            id: provider.id,
+            displayName: provider.displayName,
+            models: result.models.map((model) => ({
+              model: model.model,
+              displayName: model.displayName,
+              isDefault: model.isDefault,
+            })),
+          };
+        }),
+      );
+      const catalog: ModelCatalog = {
+        providers: settled
+          .filter(
+            (result): result is PromiseFulfilledResult<ModelCatalog["providers"][number]> =>
+              result.status === "fulfilled",
+          )
+          .map((result) => result.value)
+          .filter((provider) => provider.models.length > 0),
+      };
+      catalogCache = { at: Date.now(), catalog };
+      if (catalog.providers.length > 0) {
+        void bb.storage.kv.set(MODEL_CATALOG_CACHE_KEY, catalogCache).catch(() => {});
+      }
+      return catalog;
+    })().finally(() => {
+      catalogInflight = null;
+    });
+    return catalogInflight;
+  }
+
+  async function listModels(): Promise<ModelCatalog> {
+    if (catalogCache === null) {
+      const persisted = await bb.storage.kv.get(MODEL_CATALOG_CACHE_KEY);
+      const parsed = z
+        .object({ at: z.number(), catalog: modelCatalogSchema })
+        .safeParse(persisted);
+      if (parsed.success) catalogCache = parsed.data;
+    }
+    if (catalogCache === null) return refreshModelCatalog();
+    if (Date.now() - catalogCache.at > MODEL_CATALOG_CACHE_MAX_AGE_MS) {
+      void refreshModelCatalog();
+    }
+    return catalogCache.catalog;
+  }
+
   bb.rpc.register(rpcContract, {
     getSettings: readSettings,
     updateSettings,
     createThread: async ({ request }) =>
       createRoutedThread(bb, request, await readSettings()),
+    listModels,
   });
 
   bb.cli.register({
@@ -137,7 +260,7 @@ export default async function plugin(bb: BbPluginApi) {
         name: "config",
         summary: "Update Autorouter settings",
         usage:
-          "bb autorouter config [--enabled true|false] [--frugality 0-100] [--decision-agent automatic|provider/model] [--instructions text] [--json]",
+          "bb autorouter config [--enabled true|false] [--frugality 0-100] [--decision-agent automatic|provider/model] [--automatic-fallback provider/model,provider/model,...] [--difficulty-bands '[{\"minDifficulty\":N|null,\"maxDifficulty\":N|null,\"fallbackChain\":[...]}]'] [--task-type-bands '[{\"taskType\":str,\"fallbackChain\":[...]}]'] [--excluded-models provider,provider/model,...] [--allowed-providers provider,provider,...] [--escalation-rules '[{\"id\":str,\"fromProvider\":str,\"toModel\":str,\"responseLimit\":N,\"handoffNote\":str}]'] [--instructions text] [--json]",
       },
       {
         name: "route",
@@ -173,7 +296,52 @@ export default async function plugin(bb: BbPluginApi) {
             if (flag === "--enabled") patch.enabled = parseBoolean(value);
             else if (flag === "--frugality") patch.frugality = Number(value);
             else if (flag === "--decision-agent") patch.decisionAgent = value;
-            else if (flag === "--instructions")
+            else if (flag === "--automatic-fallback")
+              patch.automaticFallbackChain = value
+                .split(",")
+                .map((entry) => entry.trim())
+                .filter((entry) => entry.length > 0);
+            else if (flag === "--difficulty-bands") {
+              let parsedBands: unknown;
+              try {
+                parsedBands = JSON.parse(value);
+              } catch {
+                throw new Error(
+                  '--difficulty-bands expects JSON, e.g. \'[{"minDifficulty":null,"maxDifficulty":25,"fallbackChain":["antigravity","codex"]},{"minDifficulty":26,"maxDifficulty":75,"fallbackChain":["codex/gpt-5.6-terra"]}]\'',
+                );
+              }
+              patch.difficultyBands = parsedBands as AutorouterSettings["difficultyBands"];
+            } else if (flag === "--task-type-bands") {
+              let parsedTaskBands: unknown;
+              try {
+                parsedTaskBands = JSON.parse(value);
+              } catch {
+                throw new Error(
+                  '--task-type-bands expects JSON, e.g. \'[{"taskType":"vision","fallbackChain":["antigravity"]}]\'',
+                );
+              }
+              patch.taskTypeBands = parsedTaskBands as AutorouterSettings["taskTypeBands"];
+            } else if (flag === "--excluded-models")
+              patch.excludedModels = value
+                .split(",")
+                .map((entry) => entry.trim())
+                .filter((entry) => entry.length > 0);
+            else if (flag === "--allowed-providers")
+              patch.allowedProviders = value
+                .split(",")
+                .map((entry) => entry.trim())
+                .filter((entry) => entry.length > 0);
+            else if (flag === "--escalation-rules") {
+              let parsedRules: unknown;
+              try {
+                parsedRules = JSON.parse(value);
+              } catch {
+                throw new Error(
+                  '--escalation-rules expects JSON, e.g. \'[{"id":"claude-to-codex","fromProvider":"claude-code","toModel":"codex/gpt-5.6-terra","responseLimit":3,"handoffNote":"Picking up after Claude hit its usage limit. Check project instructions for current state and required standards before continuing."}]\'',
+                );
+              }
+              patch.escalationRules = parsedRules as AutorouterSettings["escalationRules"];
+            } else if (flag === "--instructions")
               patch.customInstructions = value;
             else throw new Error(`Unknown config flag: ${flag}`);
           }

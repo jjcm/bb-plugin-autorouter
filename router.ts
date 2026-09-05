@@ -1,6 +1,7 @@
 import type { BbPluginApi, NewThreadRequest } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
+  isRoutableProvider,
   rankAutoModelOptions,
   type AutoModelCandidate,
   type AutoModelRankedOption,
@@ -9,22 +10,30 @@ import {
 import {
   AUTOMATIC_DECISION_AGENT,
   type AutorouterSettings,
+  type DifficultyBand,
+  type TaskTypeBand,
+  type EscalationRule,
 } from "./settings.js";
 
 const MAX_TASK_TEXT_LENGTH = 20_000;
 const DEFAULT_DIFFICULTY = 50;
 const CLASSIFIER_TIMEOUT_MS = 60_000;
+const ESCALATION_STATE_KEY = "escalation-state";
+
+export { isRoutableProvider };
 
 const difficultyDecisionSchema = z
   .object({
     difficulty: z.number().int().min(0).max(100),
     modelOverride: z.string().min(1).max(200).optional(),
+    taskType: z.string().min(1).max(100).optional(),
   })
   .strict();
 
 interface DifficultyDecision {
   difficulty: number;
   modelOverride: string | null;
+  taskType?: string | null;
 }
 
 export interface ResolvedRoute {
@@ -38,11 +47,20 @@ export interface ResolvedRoute {
   providerId: string;
   reasoningLevel: ReasoningLevel;
   supportsServiceTier: boolean;
+  /** Set when this route came from an active escalation window; the caller
+   * (createRoutedThread) prepends it to the spawned thread's prompt so the
+   * escalated model knows it's picking up mid-task. Absent/null otherwise. */
+  escalationNote?: string | null;
 }
 
 export interface RoutedThreadResult extends ResolvedRoute {
   threadId: string;
 }
+
+type EscalationState = Record<
+  string,
+  { awaitingRecovery: boolean; responsesRemaining: number }
+>;
 
 type UsageResponse = Awaited<
   ReturnType<BbPluginApi["sdk"]["system"]["usageLimits"]>
@@ -95,6 +113,28 @@ export function matchModelOverride(
   );
 }
 
+export function filterExcludedAndDisallowed(
+  candidates: AutoModelCandidate[],
+  settings: AutorouterSettings,
+): AutoModelCandidate[] {
+  const withoutExcluded = candidates.filter((candidate) =>
+    !settings.excludedModels.some((entry) => {
+      const [providerId, model] = entry.split("/", 2);
+      return (
+        candidate.providerId === providerId &&
+        (model === undefined ||
+          candidate.model.model === model ||
+          candidate.model.id === model)
+      );
+    }),
+  );
+  // Exclusions are the hard safety boundary, so apply them before the
+  // allowlist: a permitted provider must not make an excluded model eligible.
+  if (settings.allowedProviders.length === 0) return withoutExcluded;
+  const allowed = new Set(settings.allowedProviders);
+  return withoutExcluded.filter((candidate) => allowed.has(candidate.providerId));
+}
+
 export function isModelOverrideGrounded(
   requestedModel: string,
   candidates: AutoModelCandidate[],
@@ -111,9 +151,16 @@ export function isModelOverrideGrounded(
 }
 
 function remainingQuota(
-  usage: UsageEntry,
+  usage: UsageEntry | undefined,
   options: { useSpendWhenIncludedQuotaIsExhausted: boolean },
 ): number {
+  // sdk.system.usageLimits() has been observed to omit a provider's entry
+  // entirely rather than report a typed error status for it (a bb-core
+  // quirk seen independently in bb-plugin-usage's own provider-limits
+  // fetch, not something this plugin can fix). Treat a missing entry the
+  // same as an in-band "error" status: don't let a quota-fetch failure
+  // silently break routing.
+  if (usage === undefined) return 1;
   if (
     usage.status === "not_installed" ||
     usage.status === "unauthenticated" ||
@@ -152,26 +199,112 @@ function remainingQuota(
 export function quotaRemainingByProvider(
   usage: UsageResponse,
 ): ReadonlyMap<string, number> {
+  // bb 0.40 returns usage keyed by provider id (for example
+  // `"claude-code"`), whereas older SDK snapshots used camelCase fields.
+  // Accept both so an exhausted provider is never silently treated as
+  // available during a rolling bb/plugin update.
+  const entry = (providerId: string, legacyKey: string): UsageEntry | undefined =>
+    usage[providerId] ?? usage[legacyKey];
   return new Map([
     [
       "codex",
-      remainingQuota(usage.codex, {
+      remainingQuota(entry("codex", "codex"), {
         useSpendWhenIncludedQuotaIsExhausted: false,
       }),
     ],
     [
       "claude-code",
-      remainingQuota(usage.claudeCode, {
+      remainingQuota(entry("claude-code", "claudeCode"), {
         useSpendWhenIncludedQuotaIsExhausted: false,
       }),
     ],
     [
       "acp-cursor",
-      remainingQuota(usage.cursor, {
+      remainingQuota(entry("acp-cursor", "cursor"), {
         useSpendWhenIncludedQuotaIsExhausted: true,
       }),
     ],
   ]);
+}
+
+function parseEscalationState(value: unknown): EscalationState {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([id, entry]) => {
+      if (
+        typeof entry !== "object" ||
+        entry === null ||
+        Array.isArray(entry) ||
+        !("responsesRemaining" in entry) ||
+        typeof entry.responsesRemaining !== "number" ||
+        entry.responsesRemaining < 0
+      ) {
+        return [];
+      }
+      return [[id, {
+        awaitingRecovery:
+          "awaitingRecovery" in entry && entry.awaitingRecovery === false
+            ? false
+            : true,
+        responsesRemaining: entry.responsesRemaining,
+      }]];
+    }),
+  );
+}
+
+async function readEscalationState(bb: BbPluginApi): Promise<EscalationState> {
+  return parseEscalationState(
+    await bb.storage.kv.get(ESCALATION_STATE_KEY),
+  );
+}
+
+export async function checkEscalation(
+  bb: BbPluginApi,
+  rules: readonly EscalationRule[],
+  quota: ReadonlyMap<string, number>,
+): Promise<{ rule: EscalationRule; note: string } | null> {
+  const state = await readEscalationState(bb);
+  let stateChanged = false;
+  // A completed window stays disarmed while the source provider remains
+  // exhausted. Only a positive quota observation re-arms the rule, so a
+  // responseLimit of 1 really means one routed thread rather than one per
+  // request forever.
+  for (const rule of rules) {
+    if ((quota.get(rule.fromProvider) ?? 1) > 0 && state[rule.id] !== undefined) {
+      delete state[rule.id];
+      stateChanged = true;
+    }
+  }
+  for (const rule of rules) {
+    const entry = state[rule.id];
+    if ((quota.get(rule.fromProvider) ?? 1) > 0) continue;
+    if ((entry?.responsesRemaining ?? 0) > 0) {
+      return { rule, note: rule.handoffNote };
+    }
+    if (entry?.awaitingRecovery) continue;
+    state[rule.id] = {
+      awaitingRecovery: true,
+      responsesRemaining: rule.responseLimit,
+    };
+    await bb.storage.kv.set(ESCALATION_STATE_KEY, state);
+    return { rule, note: rule.handoffNote };
+  }
+  if (stateChanged) await bb.storage.kv.set(ESCALATION_STATE_KEY, state);
+  return null;
+}
+
+export async function consumeEscalation(
+  bb: BbPluginApi,
+  ruleId: string,
+): Promise<void> {
+  const state = await readEscalationState(bb);
+  const entry = state[ruleId];
+  if (!entry) return;
+  entry.responsesRemaining -= 1;
+  if (entry.responsesRemaining < 0) entry.responsesRemaining = 0;
+  await bb.storage.kv.set(ESCALATION_STATE_KEY, state);
 }
 
 function difficultyPrompt(args: {
@@ -186,6 +319,8 @@ function difficultyPrompt(args: {
     'Return only compact JSON: {"difficulty": NUMBER}.',
     'Add "modelOverride" only when the task explicitly asks for a specific model, or when the user instructions below explicitly require a specific model for this task.',
     "Never choose or recommend a model on your own. When set, copy the requested model name as closely as possible.",
+    'When the task fundamentally involves analyzing an image, video, or audio input, add "taskType": "vision".',
+    'Omit "taskType" entirely for normal text or code tasks.',
     args.customInstructions.trim()
       ? `User rating instructions:\n${args.customInstructions.trim()}`
       : "",
@@ -205,6 +340,7 @@ export function parseDifficultyDecision(output: string): DifficultyDecision {
         return {
           difficulty: parsed.data.difficulty,
           modelOverride: parsed.data.modelOverride?.trim() || null,
+          taskType: parsed.data.taskType?.trim() || null,
         };
       }
     } catch {
@@ -213,7 +349,11 @@ export function parseDifficultyDecision(output: string): DifficultyDecision {
   }
   const integer = trimmed.match(/(?:^|\D)(100|[1-9]?\d)(?:\D|$)/u)?.[1];
   if (integer !== undefined) {
-    return { difficulty: Number(integer), modelOverride: null };
+    return {
+      difficulty: Number(integer),
+      modelOverride: null,
+      taskType: null,
+    };
   }
   throw new Error("The difficulty agent did not return a 0-100 score");
 }
@@ -278,7 +418,7 @@ async function loadCandidates(
   const supported = providers.filter(
     (provider) =>
       provider.available &&
-      new Set(["codex", "claude-code", "acp-cursor"]).has(provider.id),
+      isRoutableProvider(provider.id),
   );
   const results = await Promise.all(
     supported.map(async (provider) => ({
@@ -370,10 +510,21 @@ function classifierCandidate(
         (candidate.model.model === model || candidate.model.id === model),
     );
   const configured = settings.decisionAgent.split("/", 2);
+  const fromFallbackChain = () => {
+    for (const entry of settings.automaticFallbackChain) {
+      const [providerId, model] = entry.split("/", 2);
+      const found = exact(providerId ?? "", model ?? "");
+      if (found) return found;
+    }
+    return undefined;
+  };
   const selected =
     settings.decisionAgent === AUTOMATIC_DECISION_AGENT
-      ? (exact("acp-cursor", "gpt-5.6-sol-medium") ??
-        exact("codex", "gpt-5.6-luna") ??
+      ? // The user's ordered provider/model preferences, tried in order;
+        // falling further to any launchable model, then whatever's first,
+        // is a last-resort safety net (not a preference) for when none of
+        // the configured chain is actually available right now.
+        (fromFallbackChain() ??
         usable.find((candidate) =>
           candidate.model.supportedReasoningEfforts.some(
             (effort) => effort.reasoningEffort === "none",
@@ -491,7 +642,7 @@ function safePermissionMode(
   return supported[0] ?? "accept-edits";
 }
 
-function fallbackSelection(
+export function fallbackSelection(
   candidates: AutoModelCandidate[],
   request: NewThreadRequest,
   difficulty: number,
@@ -531,6 +682,130 @@ function fallbackSelection(
   };
 }
 
+/**
+ * The caller that accepts this route should prepend `rule.handoffNote` to the
+ * text input in `request.input` immediately before spawning the routed thread.
+ */
+export function escalationRoute(
+  candidates: AutoModelCandidate[],
+  quota: ReadonlyMap<string, number>,
+  request: NewThreadRequest,
+  difficulty: number,
+  frugality: number,
+  rule: EscalationRule,
+): ResolvedRoute | null {
+  const [providerId, model] = rule.toModel.split("/", 2);
+  const eligible = candidates.filter(
+    (candidate) =>
+      candidate.providerId === providerId &&
+      (candidate.model.model === model || candidate.model.id === model) &&
+      (quota.get(candidate.providerId) ?? 1) > 0,
+  );
+  return eligible.length > 0
+    ? fallbackSelection(eligible, request, difficulty, frugality, false)
+    : null;
+}
+
+/**
+ * Per-difficulty model selection: `settings.difficultyBands`, native
+ * two-sided ranges checked low-to-high by effective lower bound. The first
+ * band whose [minDifficulty, maxDifficulty] range covers the task's
+ * difficulty score routes through that band's own fallback chain instead of
+ * the normal CursorBench-driven ranking below — skipping capability-matched
+ * ranking entirely for difficulty ranges where the user has said "just use
+ * this" (e.g. simple tasks don't need a benchmark curve built for harder
+ * work; they need the cheapest thing that can do them). Bands, their
+ * ranges, and their chains are a plain user setting — there is no
+ * hardcoded difficulty cutoff or provider priority left in this file.
+ */
+function candidatesForChainEntry(
+  candidates: AutoModelCandidate[],
+  quota: ReadonlyMap<string, number>,
+  entry: string,
+): AutoModelCandidate[] {
+  const [providerId, model] = entry.split("/", 2);
+  return candidates.filter(
+    (candidate) =>
+      candidate.providerId === providerId &&
+      (quota.get(candidate.providerId) ?? 1) > 0 &&
+      (model === undefined ||
+        candidate.model.model === model ||
+        candidate.model.id === model),
+  );
+}
+
+export function bandMatchesDifficulty(
+  difficulty: number,
+  band: DifficultyBand,
+): boolean {
+  if (band.minDifficulty !== null && difficulty < band.minDifficulty) return false;
+  if (band.maxDifficulty !== null && difficulty > band.maxDifficulty) return false;
+  return true;
+}
+
+/** Null (unbounded below) sorts first, ahead of any real threshold. */
+function effectiveMin(band: DifficultyBand): number {
+  return band.minDifficulty ?? -1;
+}
+
+export function difficultyBandSelection(
+  candidates: AutoModelCandidate[],
+  quota: ReadonlyMap<string, number>,
+  request: NewThreadRequest,
+  difficulty: number,
+  frugality: number,
+  overrideApplied: boolean,
+  bands: readonly DifficultyBand[],
+): ResolvedRoute | null {
+  const band = [...bands]
+    .sort((a, b) => effectiveMin(a) - effectiveMin(b))
+    .find((candidate) => bandMatchesDifficulty(difficulty, candidate));
+  if (!band) return null;
+  for (const entry of band.fallbackChain) {
+    const eligible = candidatesForChainEntry(candidates, quota, entry);
+    if (eligible.length > 0) {
+      return fallbackSelection(eligible, request, difficulty, frugality, overrideApplied);
+    }
+  }
+  return null;
+}
+
+/**
+ * Per-task-type model selection: the first case-insensitive matching band
+ * routes through its fallback chain before difficulty bands or benchmark
+ * ranking. The requested standalone API does not accept a difficulty score,
+ * so selected routes carry the classifier's neutral default score.
+ */
+export function taskTypeBandSelection(
+  candidates: AutoModelCandidate[],
+  quota: ReadonlyMap<string, number>,
+  request: NewThreadRequest,
+  taskType: string | null,
+  frugality: number,
+  overrideApplied: boolean,
+  bands: readonly TaskTypeBand[],
+): ResolvedRoute | null {
+  if (taskType === null || bands.length === 0) return null;
+  const normalizedTaskType = taskType.toLowerCase();
+  const band = bands.find(
+    (candidate) => candidate.taskType.toLowerCase() === normalizedTaskType,
+  );
+  if (!band) return null;
+  for (const entry of band.fallbackChain) {
+    const eligible = candidatesForChainEntry(candidates, quota, entry);
+    if (eligible.length > 0) {
+      return fallbackSelection(
+        eligible,
+        request,
+        DEFAULT_DIFFICULTY,
+        frugality,
+        overrideApplied,
+      );
+    }
+  }
+  return null;
+}
+
 function rankedSelection(
   selected: AutoModelRankedOption,
   request: NewThreadRequest,
@@ -561,9 +836,37 @@ export async function resolveRoute(
   settings: AutorouterSettings,
 ): Promise<ResolvedRoute> {
   if (!settings.enabled) throw new Error("Autorouter is disabled");
-  const candidates = await loadCandidates(bb, request);
+  const rawCandidates = await loadCandidates(bb, request);
+  // Exclusions and the provider allowlist apply everywhere downstream --
+  // classifier selection, task-type/difficulty bands, benchmark ranking,
+  // and escalation targets all draw from this filtered pool, not the raw
+  // discovery result.
+  const candidates = filterExcludedAndDisallowed(rawCandidates, settings);
   const usage = await loadUsage(bb, request);
   const quota = quotaRemainingByProvider(usage);
+
+  // Escalation takes priority over everything else, including
+  // classification (skipping it saves the classifier call entirely when a
+  // window is active). If the escalated model isn't actually reachable
+  // right now, don't consume a response from the window on this attempt --
+  // fall through to normal routing and let the window stay open for a
+  // request that can actually use it.
+  const activeEscalation = await checkEscalation(bb, settings.escalationRules, quota);
+  if (activeEscalation) {
+    const escalated = escalationRoute(
+      candidates,
+      quota,
+      request,
+      DEFAULT_DIFFICULTY,
+      settings.frugality,
+      activeEscalation.rule,
+    );
+    if (escalated) {
+      await consumeEscalation(bb, activeEscalation.rule.id);
+      return { ...escalated, escalationNote: activeEscalation.note || null };
+    }
+  }
+
   const task = taskText(request.input);
   let decision: DifficultyDecision = {
     difficulty: DEFAULT_DIFFICULTY,
@@ -608,6 +911,31 @@ export async function resolveRoute(
   const selectionCandidates =
     eligibleOverride.length > 0 ? eligibleOverride : quotaEligible;
   const overrideApplied = eligibleOverride.length > 0;
+  if (!overrideApplied) {
+    // Task type is a stronger signal than raw difficulty for work that
+    // isn't hard, just a different kind (e.g. "describe this image"), so
+    // it's checked first.
+    const typed = taskTypeBandSelection(
+      quotaEligible,
+      quota,
+      request,
+      decision.taskType ?? null,
+      settings.frugality,
+      overrideApplied,
+      settings.taskTypeBands,
+    );
+    if (typed) return typed;
+    const banded = difficultyBandSelection(
+      quotaEligible,
+      quota,
+      request,
+      decision.difficulty,
+      settings.frugality,
+      overrideApplied,
+      settings.difficultyBands,
+    );
+    if (banded) return banded;
+  }
   const ranked = rankAutoModelOptions({
     candidates: selectionCandidates,
     difficulty: decision.difficulty,
@@ -639,8 +967,18 @@ export async function createRoutedThread(
   const route = await resolveRoute(bb, request, settings);
   const { serviceTier: requestedServiceTier, ...requestWithoutServiceTier } =
     request;
+  // An active escalation's handoff note goes in as its own text part ahead
+  // of the user's actual prompt, so the escalated model gets it as context
+  // rather than it being silently absent from what the model sees.
+  const inputWithEscalationNote = route.escalationNote
+    ? [
+        { type: "text" as const, mentions: [], text: route.escalationNote },
+        ...requestWithoutServiceTier.input,
+      ]
+    : requestWithoutServiceTier.input;
   const thread = await bb.sdk.threads.spawn({
     ...requestWithoutServiceTier,
+    input: inputWithEscalationNote,
     ...(route.supportsServiceTier && requestedServiceTier
       ? { serviceTier: requestedServiceTier }
       : {}),

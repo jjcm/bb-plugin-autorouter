@@ -94,11 +94,71 @@ grounded in one of those two sources before honoring the override.
 
 ## Supported providers
 
+Autorouter discovers available Codex, Claude Code, Cursor, and Antigravity
+(`agy`) models from BB at route time. OmniRoute remains deliberately outside
+this list: it is intended for delegated subagent work rather than interactive
+Autorouter threads.
+
 The provider, model, and CursorBench snapshot tables are compiled into the
 extension (`router.ts`, `benchmarks.ts`) and cover Codex, Claude Code, and
 Cursor as of v0.2.0. Models outside that table are still routable as fallbacks
 but do not get a capability or cost score, so the table needs a new release
 whenever a provider ships new models.
+
+### Per-difficulty model selection
+
+Antigravity has no CursorBench entry, so under normal benchmark-ranked routing
+it is only ever chosen when Codex, Claude Code, and Cursor are all
+simultaneously unavailable or quota-exhausted — a narrow, mostly-last-resort
+condition.
+
+There is no hardcoded difficulty cutoff or provider priority in the code —
+`settings.difficultyBands` is a plain, editable list of native two-sided
+range bands, `{ minDifficulty, maxDifficulty, fallbackChain }`, checked
+low-to-high by effective lower bound. Either bound may be `null` for
+"unbounded" on that side (`minDifficulty: null` matches down to 0,
+`maxDifficulty: null` matches up to 100; both `null` matches everything).
+The first band whose `[minDifficulty, maxDifficulty]` range (inclusive)
+covers a task's difficulty score skips benchmark ranking entirely and
+routes straight through that band's own ordered fallback chain — first
+provider (or exact `provider/model` pin) that's actually available and
+quota-eligible wins. If nothing in the matched band is available, or no
+band covers the score at all, routing falls through to the normal
+benchmark-ranked path below.
+
+Ranges are genuinely two-sided, not just a series of independent
+thresholds — e.g. `0–25` for one model, `26–75` for another, `76–100` for a
+third, all expressible as three bands with no gaps or overlaps needed. A
+single exact score is just `minDifficulty === maxDifficulty`.
+
+The shipped default reproduces what used to be hardcoded — a `0–25` band
+(`minDifficulty: null`) with the chain `antigravity → codex → claude-code`
+(Cursor is deliberately not in the default chain; it keeps its normal
+ranked path at every difficulty) — but it's just the *default value* of a
+setting now, not logic baked into `router.ts`. Add, remove, reorder, or
+clear bands freely from the settings page or
+`bb autorouter config --difficulty-bands '[...]'`.
+
+An explicit model override (user-requested, or from custom instructions)
+still takes priority over band matching and applies before it.
+
+### Decision agent
+
+The model that rates each task's difficulty (0-100) before routing is itself
+configurable from the same settings page, via a single searchable
+provider/model picker (`Decision agent`):
+
+- **Automatic** (default) tries an ordered `automaticFallbackChain` —
+  a plain, editable preference list, same shape and same picker as the
+  per-difficulty bands above. In this mode, checking a model in the picker
+  toggles its membership in the fallback order shown right below it, instead
+  of pinning the classifier to it.
+- Picking a specific model instead pins the classifier to exactly that
+  model, skipping the fallback order entirely.
+
+If nothing in the fallback order is available, the classifier falls back to
+any launchable model, then whatever's first — a last-resort safety net, not
+a preference, so it isn't a user-facing setting.
 
 ## Current bb extension boundary
 
