@@ -90,11 +90,61 @@ describe("model overrides", () => {
 });
 
 describe("provider quota", () => {
+  it("requires a complete supported response at compile time", () => {
+    type UsageResponse = Parameters<typeof quotaRemainingByProvider>[0];
+    // @ts-expect-error A response must include all supported providers.
+    const empty: UsageResponse = {};
+    // @ts-expect-error Codex alone is not a complete response.
+    const incomplete: UsageResponse = { codex: { status: "expired" } };
+    // @ts-expect-error Arbitrary keys cannot replace the supported providers.
+    const misspelled: UsageResponse = { claude: { status: "expired" } };
+    void [empty, incomplete, misspelled];
+  });
+
+  it("reads quota from the legacy response keys", () => {
+    const remaining = quotaRemainingByProvider({
+      codex: { status: "expired" },
+      claudeCode: {
+        status: "ok",
+        accountEmail: null,
+        planLabel: "Pro",
+        windows: [{ label: "Weekly limit", usedPercent: 25, resetsAt: null }],
+      },
+      cursor: { status: "unauthenticated" },
+    });
+    expect([...remaining]).toEqual([
+      ["codex", 0],
+      ["claude-code", 0.75],
+      ["acp-cursor", 0],
+    ]);
+  });
+
+  it("prefers provider IDs when legacy keys are also present", () => {
+    const remaining = quotaRemainingByProvider({
+      codex: { status: "expired" },
+      "claude-code": { status: "unauthenticated" },
+      "acp-cursor": { status: "not_installed" },
+      claudeCode: {
+        status: "error",
+        message: "unavailable",
+        accountEmail: null,
+        planLabel: null,
+      },
+      cursor: {
+        status: "error",
+        message: "unavailable",
+        accountEmail: null,
+        planLabel: null,
+      },
+    });
+    expect([...remaining.values()]).toEqual([0, 0, 0]);
+  });
+
   it("uses Cursor on-demand quota after included usage is exhausted", () => {
     const remaining = quotaRemainingByProvider({
       codex: { status: "expired" },
-      claudeCode: { status: "unauthenticated" },
-      cursor: {
+      "claude-code": { status: "unauthenticated" },
+      "acp-cursor": {
         status: "ok",
         accountEmail: null,
         planLabel: "Pro",

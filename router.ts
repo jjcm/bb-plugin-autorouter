@@ -44,10 +44,30 @@ export interface RoutedThreadResult extends ResolvedRoute {
   threadId: string;
 }
 
-type UsageResponse = Awaited<
+type UsageEntry = Awaited<
   ReturnType<BbPluginApi["sdk"]["system"]["usageLimits"]>
->;
-type UsageEntry = UsageResponse[keyof UsageResponse];
+>["codex"];
+type LegacyUsageResponse = {
+  codex: UsageEntry;
+  claudeCode: UsageEntry;
+  cursor: UsageEntry;
+};
+type ProviderUsageResponse = {
+  codex: UsageEntry;
+  "claude-code": UsageEntry;
+  "acp-cursor": UsageEntry;
+};
+type UsageResponse = LegacyUsageResponse | ProviderUsageResponse;
+
+function isUsageResponse(
+  usage: Partial<LegacyUsageResponse & ProviderUsageResponse>,
+): usage is UsageResponse {
+  return (
+    usage.codex !== undefined &&
+    ((usage["claude-code"] !== undefined && usage["acp-cursor"] !== undefined) ||
+      (usage.claudeCode !== undefined && usage.cursor !== undefined))
+  );
+}
 
 function taskText(input: NewThreadRequest["input"]): string {
   return input
@@ -161,15 +181,17 @@ export function quotaRemainingByProvider(
     ],
     [
       "claude-code",
-      remainingQuota(usage.claudeCode, {
-        useSpendWhenIncludedQuotaIsExhausted: false,
-      }),
+      remainingQuota(
+        "claude-code" in usage ? usage["claude-code"] : usage.claudeCode,
+        { useSpendWhenIncludedQuotaIsExhausted: false },
+      ),
     ],
     [
       "acp-cursor",
-      remainingQuota(usage.cursor, {
-        useSpendWhenIncludedQuotaIsExhausted: true,
-      }),
+      remainingQuota(
+        "acp-cursor" in usage ? usage["acp-cursor"] : usage.cursor,
+        { useSpendWhenIncludedQuotaIsExhausted: true },
+      ),
     ],
   ]);
 }
@@ -310,7 +332,7 @@ async function loadCandidates(
 async function loadUsage(
   bb: BbPluginApi,
   request: NewThreadRequest,
-): Promise<UsageResponse> {
+): Promise<Partial<LegacyUsageResponse & ProviderUsageResponse>> {
   const route = discoveryEnvironment(request);
   if (route.kind === "host") {
     return bb.sdk.system.usageLimits({ hostId: route.hostId });
@@ -563,6 +585,9 @@ export async function resolveRoute(
   if (!settings.enabled) throw new Error("Autorouter is disabled");
   const candidates = await loadCandidates(bb, request);
   const usage = await loadUsage(bb, request);
+  if (!isUsageResponse(usage)) {
+    throw new Error("BB returned an incomplete provider usage response");
+  }
   const quota = quotaRemainingByProvider(usage);
   const task = taskText(request.input);
   let decision: DifficultyDecision = {
